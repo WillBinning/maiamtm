@@ -208,7 +208,7 @@ class MTM(nn.Module):
         self.encoder_embed_dict = nn.ModuleDict()
         self.decoder_embed_dict = nn.ModuleDict()
         self.mask_token_dict = nn.ParameterDict()
-
+        self.max_game_moves = 65  # Max possible pieces on an Othello board
         self.encoder_per_dim_encoding = nn.ParameterDict()
         self.decoder_per_dim_encoding = nn.ParameterDict()
 
@@ -271,7 +271,7 @@ class MTM(nn.Module):
                 nn.GELU(),
                 nn.Linear(self.n_embd, shape[-1]),
             )
-        pos_embed = get_1d_sincos_pos_embed_from_grid(self.n_embd, self.max_len)
+        pos_embed = get_1d_sincos_pos_embed_from_grid(self.n_embd, self.max_game_moves)
         pe = torch.from_numpy(pos_embed).float()[None, :, None, :] / 2.0
         self.register_buffer("pos_embed", pe)
 
@@ -302,7 +302,7 @@ class MTM(nn.Module):
             batch_size, T, P, _ = target.size()
             if discrete_map[key]:
                 raw_loss = nn.CrossEntropyLoss(reduction="none")(
-                    pred.permute(0, 3, 1, 2), target.permute(0, 3, 1, 2)
+                    pred.permute(0, 3, 1, 2), target.permute(0, 3, 1, 2).float()
                 ).unsqueeze(3)
             else:
                 # apply normalization
@@ -355,18 +355,39 @@ class MTM(nn.Module):
         keep_len = len(ids)
         return x, ids_restore, keep_len
 
-    def trajectory_encoding(self, trajectories) -> Dict[str, torch.Tensor]:
+    def trajectory_encoding(self, trajectories, move_indices) -> Dict[str, torch.Tensor]:
         encoded_trajectories = {}
+        # Fetch dynamic pos embeddings for this batch. Shape: (B, T, 1, n_embd)
+        b_pos_embed = self.pos_embed[0, move_indices, :, :] 
+
         for key, traj in trajectories.items():
+            t = traj.shape[1]
+            key_pos_embed = b_pos_embed[:, :t, :, :] # Handles T-1 action lengths
+            
             encoded_traj = (
                 self.encoder_embed_dict[key](traj.to(torch.float32))
                 + self.encoder_per_dim_encoding[key]
-                + self.pos_embed[:, : traj.shape[1], :, :]
+                # + self.pos_embed[:, : traj.shape[1], :, :]
+                # + key_pos_embed  # TODO 
             )
             b, t, p, c = encoded_traj.shape
             x = encoded_traj.reshape(b, t * p, c)
             encoded_trajectories[key] = x
         return encoded_trajectories
+    
+    # In mtm_model.py -> MTM class
+
+    def get_move_indices(self, trajectories: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """Calculates the turn number by counting 1s in the state."""
+        states = trajectories["states"]
+        
+        # Assuming states shape is (B, T, P, C). 
+        # Summing values > 0.5 gives us the piece count.
+        move_indices = (states > 0.5).sum(dim=(2, 3)).long()
+        
+        # Clamp to prevent out-of-bounds indexing in the pos_embed table
+        move_indices = torch.clamp(move_indices, 0, self.max_game_moves - 1)
+        return move_indices  # Shape: (B, T)
 
     def process_masks(
         self, trajectories, masks, flatten_shape=True
@@ -403,24 +424,24 @@ class MTM(nn.Module):
         return batched_masks
 
     def forward(self, trajectories, masks):
-        """
-        Args:
-            trajectories: (batch_size, T, tokens_per_time, feature_dim)
-            masks: (T,) or (T, tokens_per_time), or (batch_size, T, tokens_per_time)
-        """
         batched_masks = self.process_masks(trajectories, masks)
-        embedded_trajectories = self.trajectory_encoding(trajectories)
+        
+        # Get move indices and pass to encoder
+        move_indices = self.get_move_indices(trajectories)
+        embedded_trajectories = self.trajectory_encoding(trajectories, move_indices)
 
         encoded_trajectories, ids_restore, keep_length = self.forward_encoder(
             embedded_trajectories, batched_masks
         )
 
-        # extract outputs
-        return self.forward_decoder(encoded_trajectories, ids_restore, keep_length)
+        # Pass move_indices to decoder
+        return self.forward_decoder(encoded_trajectories, ids_restore, keep_length, move_indices)
 
     def encode(self, trajectories, masks) -> Dict[str, torch.Tensor]:
         batched_masks = self.process_masks(trajectories, masks)
-        embedded_trajectories = self.trajectory_encoding(trajectories)
+        
+        move_indices = self.get_move_indices(trajectories) # <-- ADD THIS
+        embedded_trajectories = self.trajectory_encoding(trajectories, move_indices) # <-- PASS IT HERE
 
         encoded_trajectories, ids_restore, keep_length = self.forward_encoder(
             embedded_trajectories, batched_masks
@@ -455,17 +476,24 @@ class MTM(nn.Module):
 
         return encoded_trajectories, ids_restore, keep_len
 
-    def _decoder_trajectory_encoding(self, trajectories) -> Dict[str, torch.Tensor]:
+    def _decoder_trajectory_encoding(self, trajectories, move_indices) -> Dict[str, torch.Tensor]:
         encoded_trajectories = {}
+        # Fetch dynamic pos embeddings for this batch. Shape: (B, T, 1, n_embd)
+        b_pos_embed = self.pos_embed[0, move_indices, :, :]
+
         for key, traj in trajectories.items():
             data_shape = self.data_shapes[key]
             b, _, f = traj.shape
             re_traj = traj.reshape(b, -1, data_shape[0], f)
             t = re_traj.shape[1]
+            
+            key_pos_embed = b_pos_embed[:, :t, :, :] # Handles T-1 action lengths
+            
             encoded_traj = (
                 self.decoder_embed_dict[key](re_traj)
                 + self.decoder_per_dim_encoding[key]
-                + self.pos_embed[:, :t, :, :]
+                # + self.pos_embed[:, : traj.shape[1], :, :]
+                # + key_pos_embed  # TODO 
             )
             b, t, p, c = encoded_traj.shape
             x = encoded_traj.reshape(b, t * p, c)
@@ -477,6 +505,7 @@ class MTM(nn.Module):
         trajectories: Dict[str, torch.Tensor],
         ids_restore: Dict[str, torch.Tensor],
         keep_lengths: Dict[str, torch.Tensor],
+        move_indices: torch.Tensor, # <-- ADD THIS ARGUMENT
     ):
         """
         Args:
@@ -506,7 +535,8 @@ class MTM(nn.Module):
             encoded_trajectories_with_mask[k] = x_
 
         decoder_embedded_trajectories = self._decoder_trajectory_encoding(
-            encoded_trajectories_with_mask
+            encoded_trajectories_with_mask,
+            move_indices 
         )
         concat_trajectories = torch.cat(
             [decoder_embedded_trajectories[k] for k in keys], dim=1

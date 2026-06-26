@@ -5,6 +5,8 @@
 """
 Main script for training a policy given a dataset.
 """
+# HYDRA_FULL_ERROR=1 python research/mtm/train.py args.num_train_steps=2000 args.eval_every=500 args.print_every=100 args.warmup_steps=10 args.learning_rate=0.0005 args.save_every=100
+
 import os
 import pprint
 import random
@@ -55,7 +57,7 @@ from research.mtm.utils import (
 )
 
 dir_path = os.path.dirname(os.path.realpath(__file__))
-
+suffix = "_NoTE_ID_NEWAR_MEDIUM"
 
 def eval_fd(
     model: MTM,
@@ -75,11 +77,12 @@ def eval_fd(
     assert seq_len >= 2, "Forward dynamics eval only works for seq_len=2"
 
     # Given initial state and all actions. Predict future states.
-    obs_mask1 = torch.ones(seq_len, device=device)
+    obs_mask1 = torch.ones(eval_batch["states"].shape[1], device=device)
     obs_mask1[-1] = 0
-    actions_mask1 = torch.zeros(seq_len, device=device)
-    actions_mask1[-2] = 1
-    returns_mask = torch.zeros(seq_len, device=device)
+    actions_mask1 = torch.zeros(eval_batch["actions"].shape[1], device=device)
+    if actions_mask1.shape[0] >= 2:
+        actions_mask1[-2] = 1
+    returns_mask = torch.zeros(eval_batch["returns"].shape[1] if "returns" in eval_batch else eval_batch["states"].shape[1], device=device)
     masks = {
         "states": obs_mask1,
         "actions": actions_mask1,
@@ -442,7 +445,7 @@ def create_eval_logs_states_actions(
         masks_list.append(
             {
                 "states": torch.from_numpy(obs_mask).to(device),
-                "actions": torch.from_numpy(actions_mask).to(device),
+                "actions": torch.from_numpy(actions_mask[:trajectories["actions"].shape[1]]).to(device),            
             }
         )
         if rewards:
@@ -501,7 +504,7 @@ class RunConfig:
     seed: int = 0
     """RNG seed."""
 
-    batch_size: int = 64
+    batch_size: int = 256
     """Batch size used during training."""
 
     n_workers: int = 8
@@ -516,7 +519,7 @@ class RunConfig:
     eval_every: int = 5000
     """Evaluate model every N steps."""
 
-    save_every: int = 5000
+    save_every: int = 100
     """Evaluate model every N steps."""
 
     device: str = "cuda"
@@ -542,7 +545,7 @@ class RunConfig:
     traj_length: int = 1
     """Trajectory length."""
 
-    mode_weights: Tuple[int, int, int] = (0.2, 0.1, 0.7)
+    mode_weights: Tuple[int, int, int] = (0, 1.0)
     """State action return."""
 
     tsp_ratio: int = 1
@@ -562,6 +565,8 @@ def evaluate(
     vis_batch: Dict[str, torch.Tensor],
     masks: Dict[str, torch.Tensor],
 ) -> Dict[str, Any]:
+    masks = {k: m[:val_batch[k].shape[1]] if k in val_batch else m for k, m in masks.items()}
+
     encoded_batch = tokenizer_manager.encode(val_batch)
     predicted_trajectories = model(encoded_batch, masks)
     model_without_ddp = model.module if hasattr(model, "module") else model
@@ -619,7 +624,6 @@ def evaluate(
     log_dict.update(log_images)
     return log_dict
 
-
 def train_one_batch(
     model: MTM,
     optimizer: torch.optim.Optimizer,
@@ -630,7 +634,9 @@ def train_one_batch(
     masks: Dict[str, torch.Tensor],
     loss_keys: Sequence[str] = None,
 ) -> Dict[str, Any]:
+    
     encoded_batch = tokenizer_manager.encode(batch)
+
 
     # train the model
     predicted_trajectories = model(encoded_batch, masks)
@@ -668,13 +674,64 @@ def train_one_batch(
     with torch.no_grad():
         mse_loss = 0
         predictions = tokenizer_manager.decode(predicted_trajectories)
+        
+        # --- NEW VISUALIZATION PRINT (Every 10 Batches) ---
+        # Initialize a counter on the function if it doesn't exist
+        if not hasattr(train_one_batch, "batch_count"):
+            train_one_batch.batch_count = 0
+            
+        # Print only if the current batch count is a multiple of 10
+        if train_one_batch.batch_count % 10 == 0:
+            logger.info("\n" + "="*50)
+            logger.info(f"MTM TRAJECTORY VISUALIZATION (Batch {train_one_batch.batch_count}, First Item)")
+            logger.info("="*50)
+            
+            seq_len = batch["states"].shape[1]
+            
+            for t in range(seq_len):
+                logger.info(f"\n--- STEP {t} ---")
+                
+                # --- ACTIONS ---
+                if t < batch["actions"].shape[1]:  # <-- Guard against missing last action
+                    # Extract active class index using argmax instead of .item() on vectors
+                    action_in = batch["actions"][0, t].argmax().item() if batch["actions"].ndim >= 3 else batch["actions"][0, t].item()
+                    action_mask = masks["actions"][t].item() 
+                    action_pred = predictions["actions"][0, t].argmax().item() if predictions["actions"].ndim >= 3 else predictions["actions"][0, t].item()
+                    
+                    if action_mask == 1:
+                        logger.info(f"[ACTION] VISIBLE : {action_in}")
+                    else:
+                        logger.info(f"[ACTION] MASKED  : Real was {action_in} | Model Guessed -> {action_pred}")
+                else:
+                    logger.info(f"[ACTION] N/A (Last step has no action context)")
+                
+                # --- STATES ---
+                state_mask = masks["states"][t].item() 
+                
+                # Get indices where the actual pieces are
+                state_in_indices = batch["states"][0, t].nonzero(as_tuple=True)[0].tolist()
+                
+                if state_mask == 1:
+                    logger.info(f"[STATE]  VISIBLE : Pieces at {state_in_indices}")
+                else:
+                    # Model outputs floats. We threshold at 0.5 to guess if it placed a piece there
+                    state_pred_tensor = predictions["states"][0, t]
+                    state_pred_indices = (state_pred_tensor > 0.5).nonzero(as_tuple=True)[0].tolist()
+                    logger.info(f"[STATE]  MASKED  : Real pieces at {state_in_indices}")
+                    logger.info(f"                   Model Guessed -> {state_pred_indices}")
+                
+            logger.info("\n" + "="*50)
+            
+        # Increment the counter for the next batch
+        train_one_batch.batch_count += 1
+        # -------------------------------
+
         for k, v in predictions.items():
             _mse = F.mse_loss(v.to(torch.float32), batch[k].to(torch.float32)).item()
             log_dict[f"train/mse_{k}"] = _mse
             mse_loss += _mse
         log_dict["train/mse_sum"] = mse_loss
     return log_dict
-
 
 def main(hydra_cfg):
     _main(hydra_cfg)
@@ -710,8 +767,11 @@ def _main(hydra_cfg):
     val_dataset: DatasetProtocol
 
     train_dataset, val_dataset = hydra.utils.call(
-        hydra_cfg.dataset, seq_steps=cfg.traj_length
+        hydra_cfg.train_dataset, seq_steps=cfg.traj_length
     )
+    print(train_dataset[0])
+
+
     logger.info(f"Train set size = {len(train_dataset)}")
     logger.info(f"Validation set size = {len(val_dataset)}")
 
@@ -751,20 +811,24 @@ def _main(hydra_cfg):
         train_sampler = torch.utils.data.RandomSampler(train_dataset)
         val_sampler = torch.utils.data.SequentialSampler(val_dataset)
 
-    with stopwatch("data loader"):
+    # with stopwatch("data loader"):
+    #     for i in range(len(train_dataset)):
+    #         sample = train_dataset[i]
+    #         print(sample)
+
         train_loader = DataLoader(
             train_dataset,
             # shuffle=True,
             pin_memory=True,
             batch_size=cfg.batch_size,
-            num_workers=cfg.n_workers,
-            sampler=train_sampler,
-        )
+            num_workers=4,
+            sampler=train_sampler
+            )
         val_loader = DataLoader(
             val_dataset,
             # shuffle=False,
             batch_size=cfg.batch_size,
-            num_workers=1,
+            num_workers=4,
             sampler=val_sampler,
         )
 
@@ -804,7 +868,7 @@ def _main(hydra_cfg):
                 state_only_val_dataset,
                 # shuffle=False,
                 batch_size=cfg.batch_size,
-                num_workers=1,
+                num_workers=4,
                 sampler=state_only_val_sampler,
             )
         state_only_tokenizer_manager = TokenizerManager(
@@ -913,7 +977,7 @@ def _main(hydra_cfg):
         MaskType.RANDOM: lambda: create_random_masks(
             data_shapes, cfg.mask_ratios, cfg.traj_length, cfg.device
         ),
-        MaskType.FULL_RANDOM: lambda: create_full_random_masks(
+        MaskType.FULL_RANDOM: lambda: create_full_random_masks( 
             data_shapes, cfg.mask_ratios, cfg.traj_length, cfg.device
         ),
         MaskType.AUTO_MASK: lambda: create_random_autoregressize_mask(
@@ -976,6 +1040,7 @@ def _main(hydra_cfg):
     )
 
     epoch = 0
+    print("train_loader length...", len(train_loader))
 
     batch_iter = iter(train_loader)
     while True:
@@ -1001,6 +1066,9 @@ def _main(hydra_cfg):
                 # check that the mask for states is not all ones
                 if masks["states"].sum() != np.prod(masks["states"].shape):
                     break
+            for k in state_only_batch.keys():
+                if k in masks:
+                    masks[k] = masks[k][:state_only_batch[k].shape[1]]
             masks["actions"] = masks["actions"] * 0  # ignore all actions
             state_only_batch["actions"] = (
                 state_only_batch["actions"] * 0
@@ -1012,6 +1080,7 @@ def _main(hydra_cfg):
                 optimizer,
                 scheduler,
                 state_only_tokenizer_manager,
+            
                 discrete_map,
                 state_only_batch,
                 masks,
@@ -1037,7 +1106,13 @@ def _main(hydra_cfg):
             if "images" in batch and "images" not in masks:
                 masks["images"] = masks["states"]
 
+            for k in batch.keys():
+                if k in masks:
+                    masks[k] = masks[k][:batch[k].shape[1]]
+
             batch = {k: v.to(cfg.device, non_blocking=True) for k, v in batch.items()}
+            # print("batch_details")
+            # print(batch)
             _log_dict = train_one_batch(
                 model,
                 optimizer,
@@ -1066,15 +1141,15 @@ def _main(hydra_cfg):
                     "step": step,
                     "eval_max": dict(eval_max),
                 },
-                f"model_{step}.pt",
+                f"model_{step}{suffix}.pt", #TODO Update per change
             )
             try:
                 if step > 3 * cfg.save_every:
                     remove_step = step - 3 * cfg.save_every
-                    if (remove_step // cfg.save_every) % 10 != 0:
-                        os.remove(f"model_{remove_step}.pt")
+                    if (remove_step // cfg.save_every) % 10 != 0 and remove_step % 500 != 0:
+                        os.remove(f"model_{remove_step}{suffix}.pt")
             except Exception as e:
-                logger.error(f"Failed to remove model file! {e}")
+                logger.error(f"Failed to remove model file! {e}") #TODO
 
         if step % cfg.eval_every == 0 and step != 0:
             # if step % cfg.eval_every == 0:
@@ -1161,7 +1236,7 @@ def _main(hydra_cfg):
             "step": step,
             "eval_max": dict(eval_max),
         },
-        f"model_{step}.pt",
+        f"model_{step}{suffix}.pt", #TODO change per change
     )
 
 

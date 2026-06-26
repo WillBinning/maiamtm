@@ -1,13 +1,31 @@
 defaults:
-    - datasets: d4rl
     - override hydra/launcher: slurm
     - override hydra/output: local
     - _self_
 
+# 1. Define your custom dataset target
+train_dataset:
+    _target_: research.mtm.datasets.rustothello.ThreadDataset.create_splits
+    data_path: "/home/will/projects/files/training_boards.txt"
+
+eval_dataset: 
+    _target_: research.mtm.datasets.rustothello.ThreadDataset.create_splits
+    data_path: "/home/will/projects/files/small_training_boards.txt"
+    # depth is automatically overridden by args.traj_length in train.py via hydra.utils.call
+
+# 2. Map your keys to the correct Tokenizers
+tokenizers:
+    states:
+        _target_: research.mtm.tokenizers.continuous.ContinuousTokenizer.create
+    actions:
+        _target_: research.mtm.tokenizers.discrete_identity.DiscreteIdentity.create        
+        num_classes: 66 # Adjust this to match your game's total legal move vocabulary size
+
+
 model_config:
     _target_: research.mtm.models.mtm_model.MTMConfig
     norm: "none"
-    n_embd: 512
+    n_embd: 256
     n_enc_layer: 2
     n_dec_layer: 1
     n_head: 4
@@ -19,38 +37,31 @@ state_only_dataset: null
 
 args:
     _target_: research.mtm.train.RunConfig
-    seed: 0
-    batch_size: 2048
+    seed: 42
+    batch_size: 4096
     n_workers: 10
     traj_length: 4
-
-    ### Debug
-    # log_every: 1
-    # print_every: 1
-    # eval_every: 1
-    # save_every: 1
 
     log_every: 100
     print_every: 1000
     eval_every: 20000
-    save_every: 10000
+    save_every: 100
 
     device: cuda
-    mask_ratios: [0.5, 0.6, 0.7, 0.8, 0.85, 0.9, 0.95, 1.0]
-    mask_patterns: ["AUTO_MASK"]
+    mask_patterns: ["ID"]
     warmup_steps: 40000
     num_train_steps: 140010
     learning_rate: 0.0001
     weight_decay:  0.005
-    mode_weights: [0.2, 0.1, 0.7]
+    
+    # Adjusted for exactly 2 modalities: [states, actions]
+    mode_weights: [0.5, 0.5] 
     tsp_ratio: 1
-
 
 wandb:
   project: experiments
   entity: ""
   resume: null
-  # resume: allow
 
 job_name: job
 

@@ -215,8 +215,9 @@ def create_full_random_masks(
 
     for k, v in data_shapes.items():
         # create a random mask, different mask for each modality
-        random_mask = create_full_random_mask(v, traj_length, mask_ratios, device)
-        masks[k] = random_mask
+        # random_mask = create_full_random_mask(v, traj_length, mask_ratios, device)
+        # masks[k] = random_mask #TODO This is the models random AR mask
+        masks[k] = torch.ones((traj_length, v[0] if len(v) > 0 else 1), device=device) #TODO this is pure AR mask
     return masks
 
 
@@ -270,13 +271,33 @@ def create_rcbc_mask(
 
 
 def create_random_autoregressize_mask(
-    data_shapes, mask_ratios, traj_length, device, p_weights=(0.2, 0.1, 0.7)
+    data_shapes, mask_ratios, traj_length, device, p_weights=(0,1.0)
 ) -> Dict[str, np.ndarray]:
-    mode_order = ["states", "returns", "actions"]
+    mode_order = ["states", "actions"]
     random_mode = np.random.choice(mode_order, p=p_weights)
     random_position = np.random.randint(0, traj_length)
     masks = {}
 
+    # 1. START WITH EVERYTHING VISIBLE
+    for k, v in data_shapes.items():
+        # v[0] represents the 'P' dimension (tokens/pieces per timestep)
+        P = v[0] if len(v) > 0 else 1
+        masks[k] = torch.ones((traj_length, P), dtype=torch.float32, device=device)
+
+    # 2. CUT OFF THE FUTURE
+    end_plus_one = False
+    for k in mode_order:
+        if k == random_mode:
+            end_plus_one = True
+
+        if k in masks:
+            if end_plus_one:
+                masks[k][random_position:, :] = 0  # Hide current and future
+            else:
+                masks[k][random_position + 1 :, :] = 0  # Hide only future
+
+    return masks
+'''THIS IS OLD RANDOM AR MASKING, COULD BRING BACK
     for k, v in data_shapes.items():
         # create a random mask, different mask for each modality
         masks[k] = create_full_random_mask(v, traj_length, mask_ratios, device)
@@ -295,6 +316,7 @@ def create_random_autoregressize_mask(
 
     # print(random_mode, random_position)
     return masks
+    '''
 
 
 def create_random_bc_masks(

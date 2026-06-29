@@ -53,8 +53,9 @@ def run_inference(
     ratio: int = 1
 ) -> Dict[str, torch.Tensor]:
     model.eval()
+    strats = batch["strats"]
     encoded_batch = tokenizer_manager.encode(batch)
-    predictions = model.mask_git_forward(encoded_batch, masks, ratio=ratio)
+    predictions = model.mask_git_forward(encoded_batch, masks, strats, ratio=ratio)
     return tokenizer_manager.decode(predictions)
 
 def main(hydra_cfg: DictConfig):

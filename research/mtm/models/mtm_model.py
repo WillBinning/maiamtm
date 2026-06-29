@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import wandb
-
+from utils import create_strat_emb
 from research.mtm.tokenizers.base import TokenizerManager
 from research.utils.plot_utils import PlotHandler as ph
 
@@ -51,10 +51,10 @@ def make_plots_with_masks(
     eval_logs = {}
     for masks, prefix in zip(masks_list, prefixs):
         eval_name = f"{prefix}_eval"
-
+        strats = trajectories["strats"]
         encoded_trajectories = tokenizer_manager.encode(trajectories)
         decoded_gt_trajectories = tokenizer_manager.decode(encoded_trajectories)
-        predictions = predict_fn(encoded_trajectories, masks)
+        predictions = predict_fn(encoded_trajectories, masks, strats)
         decoded_trajs = tokenizer_manager.decode(predictions)
 
         mse_loss = 0
@@ -274,6 +274,8 @@ class MTM(nn.Module):
         pos_embed = get_1d_sincos_pos_embed_from_grid(self.n_embd, self.max_game_moves)
         pe = torch.from_numpy(pos_embed).float()[None, :, None, :] / 2.0
         self.register_buffer("pos_embed", pe)
+        self.strat_embedding = torch.nn.Linear(3,config.n_embd)
+
 
     @staticmethod
     def forward_loss(
@@ -355,7 +357,7 @@ class MTM(nn.Module):
         keep_len = len(ids)
         return x, ids_restore, keep_len
 
-    def trajectory_encoding(self, trajectories, move_indices) -> Dict[str, torch.Tensor]:
+    def trajectory_encoding(self, trajectories, move_indices, strats) -> Dict[str, torch.Tensor]:
         encoded_trajectories = {}
         # Fetch dynamic pos embeddings for this batch. Shape: (B, T, 1, n_embd)
         b_pos_embed = self.pos_embed[0, move_indices, :, :] 
@@ -363,10 +365,16 @@ class MTM(nn.Module):
         for key, traj in trajectories.items():
             t = traj.shape[1]
             key_pos_embed = b_pos_embed[:, :t, :, :] # Handles T-1 action lengths
+
+            strat_emb = create_strat_emb(trajectories, strats, self.config.n_embd)
+            strat_emb = self.strat_embedding(strat_emb.float())
+            strat_emb = strat_emb[:, None, None, :]
+
             
             encoded_traj = (
                 self.encoder_embed_dict[key](traj.to(torch.float32))
                 + self.encoder_per_dim_encoding[key]
+                + strat_emb
                 # + self.pos_embed[:, : traj.shape[1], :, :]
                 # + key_pos_embed  # TODO 
             )
@@ -423,25 +431,25 @@ class MTM(nn.Module):
             batched_masks[k] = mask
         return batched_masks
 
-    def forward(self, trajectories, masks):
+    def forward(self, trajectories, masks, strats):
         batched_masks = self.process_masks(trajectories, masks)
         
         # Get move indices and pass to encoder
         move_indices = self.get_move_indices(trajectories)
-        embedded_trajectories = self.trajectory_encoding(trajectories, move_indices)
-
+        embedded_trajectories = self.trajectory_encoding(trajectories, move_indices, strats)
+        
         encoded_trajectories, ids_restore, keep_length = self.forward_encoder(
             embedded_trajectories, batched_masks
         )
 
         # Pass move_indices to decoder
-        return self.forward_decoder(encoded_trajectories, ids_restore, keep_length, move_indices)
+        return self.forward_decoder(encoded_trajectories, ids_restore, keep_length, move_indices,strats)
 
-    def encode(self, trajectories, masks) -> Dict[str, torch.Tensor]:
+    def encode(self, trajectories, masks, strats) -> Dict[str, torch.Tensor]:
         batched_masks = self.process_masks(trajectories, masks)
         
-        move_indices = self.get_move_indices(trajectories) # <-- ADD THIS
-        embedded_trajectories = self.trajectory_encoding(trajectories, move_indices) # <-- PASS IT HERE
+        move_indices = self.get_move_indices(trajectories)
+        embedded_trajectories = self.trajectory_encoding(trajectories, move_indices, strats) # <-- PASS IT HERE
 
         encoded_trajectories, ids_restore, keep_length = self.forward_encoder(
             embedded_trajectories, batched_masks
@@ -476,7 +484,7 @@ class MTM(nn.Module):
 
         return encoded_trajectories, ids_restore, keep_len
 
-    def _decoder_trajectory_encoding(self, trajectories, move_indices) -> Dict[str, torch.Tensor]:
+    def _decoder_trajectory_encoding(self, trajectories, move_indices, strats) -> Dict[str, torch.Tensor]:
         encoded_trajectories = {}
         # Fetch dynamic pos embeddings for this batch. Shape: (B, T, 1, n_embd)
         b_pos_embed = self.pos_embed[0, move_indices, :, :]
@@ -488,10 +496,13 @@ class MTM(nn.Module):
             t = re_traj.shape[1]
             
             key_pos_embed = b_pos_embed[:, :t, :, :] # Handles T-1 action lengths
-            
+            strat_emb = create_strat_emb(trajectories, strats, self.config.n_embd)
+            strat_emb = self.strat_embedding(strat_emb.float())
+            strat_emb = strat_emb[:, None, None, :]
             encoded_traj = (
                 self.decoder_embed_dict[key](re_traj)
                 + self.decoder_per_dim_encoding[key]
+                + strat_emb
                 # + self.pos_embed[:, : traj.shape[1], :, :]
                 # + key_pos_embed  # TODO 
             )
@@ -505,7 +516,8 @@ class MTM(nn.Module):
         trajectories: Dict[str, torch.Tensor],
         ids_restore: Dict[str, torch.Tensor],
         keep_lengths: Dict[str, torch.Tensor],
-        move_indices: torch.Tensor, # <-- ADD THIS ARGUMENT
+        move_indices: torch.Tensor, 
+        strats
     ):
         """
         Args:
@@ -536,7 +548,9 @@ class MTM(nn.Module):
 
         decoder_embedded_trajectories = self._decoder_trajectory_encoding(
             encoded_trajectories_with_mask,
-            move_indices 
+            move_indices,
+            strats
+            #TODO   
         )
         concat_trajectories = torch.cat(
             [decoder_embedded_trajectories[k] for k in keys], dim=1
@@ -554,7 +568,7 @@ class MTM(nn.Module):
             pos += t_p
         return extracted_trajectories
 
-    def mask_git_forward(self, trajectories, masks, temperature=1.0, ratio=1.0):
+    def mask_git_forward(self, trajectories, masks, strats, temperature=1.0, ratio=1.0):
         """Use MaskGIT style decoding
 
         Assumes that the last dimension is logits (only works for discrete model case)
@@ -564,7 +578,7 @@ class MTM(nn.Module):
         trajectories_copy = {k: torch.clone(v) for k, v in trajectories.items()}
 
         if ratio == 1.0:
-            return self(trajectories_copy, masks_copy)
+            return self(trajectories_copy, masks_copy, strats)
 
         num_choose = int(
             ratio

@@ -57,7 +57,7 @@ from research.mtm.utils import (
 )
 
 dir_path = os.path.dirname(os.path.realpath(__file__))
-suffix = "_NoTE_ID_NEWAR_MEDIUM"
+suffix = "_AR_NoSTRAT_Big"
 
 def eval_fd(
     model: MTM,
@@ -563,18 +563,21 @@ def evaluate(
     discrete_map: Dict[str, bool],
     val_batch: Dict[str, torch.Tensor],
     vis_batch: Dict[str, torch.Tensor],
-    masks: Dict[str, torch.Tensor],
-) -> Dict[str, Any]:
+    masks: Dict[str, torch.Tensor]
+    ) -> Dict[str, Any]:
     masks = {k: m[:val_batch[k].shape[1]] if k in val_batch else m for k, m in masks.items()}
+    strats = val_batch["strats"]
 
     encoded_batch = tokenizer_manager.encode(val_batch)
-    predicted_trajectories = model(encoded_batch, masks)
+    predicted_trajectories = model(encoded_batch, masks, strats)
     model_without_ddp = model.module if hasattr(model, "module") else model
     (
         loss,
         losses_dict,
         masked_losses,
         masked_c_losses,
+
+
     ) = MTM.forward_loss(
         encoded_batch,
         predicted_trajectories,
@@ -582,7 +585,7 @@ def evaluate(
         discrete_map,
         norm=model_without_ddp.norm,
         reduce_use_sum=model_without_ddp.config.reduce_use_sum,
-        loss_keys=model_without_ddp.config.loss_keys,
+        loss_keys=model_without_ddp.config.loss_keys
     )
 
     log_dict = {"val/val_loss": loss.item()}
@@ -634,13 +637,14 @@ def train_one_batch(
     masks: Dict[str, torch.Tensor],
     loss_keys: Sequence[str] = None,
 ) -> Dict[str, Any]:
-    
-    encoded_batch = tokenizer_manager.encode(batch)
+    # print(batch["strats"])
+    strats = batch["strats"]
 
+    encoded_batch = tokenizer_manager.encode(batch)
+    # print(encoded_batch)
 
     # train the model
-    predicted_trajectories = model(encoded_batch, masks)
-
+    predicted_trajectories = model(encoded_batch, masks, strats)
     # compute the loss
     model_without_ddp = model.module if hasattr(model, "module") else model
     if loss_keys is None:
@@ -769,7 +773,7 @@ def _main(hydra_cfg):
     train_dataset, val_dataset = hydra.utils.call(
         hydra_cfg.train_dataset, seq_steps=cfg.traj_length
     )
-    print(train_dataset[0])
+    # print(train_dataset[0])
 
 
     logger.info(f"Train set size = {len(train_dataset)}")
@@ -1171,7 +1175,7 @@ def _main(hydra_cfg):
                 discrete_map,
                 val_batch,
                 vis_batch,
-                eval_masks,
+                eval_masks
             )
             log_dict.update(_val_dict)
 

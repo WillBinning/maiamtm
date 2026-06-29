@@ -6,11 +6,12 @@ defaults:
 # 1. Define your custom dataset target
 train_dataset:
     _target_: research.mtm.datasets.rustothello.ThreadDataset.create_splits
-    data_path: "/home/will/projects/files/training_boards.txt"
+    data_path:  "/home/will/projects/files/big_training_boards.txt"
+    # "/home/will/projects/files/training_boards.txt"
 
 eval_dataset: 
     _target_: research.mtm.datasets.rustothello.ThreadDataset.create_splits
-    data_path: "/home/will/projects/files/small_training_boards.txt"
+    data_path: "/home/will/projects/files/testing_boards.txt"
     # depth is automatically overridden by args.traj_length in train.py via hydra.utils.call
 
 # 2. Map your keys to the correct Tokenizers
@@ -48,7 +49,7 @@ args:
     save_every: 100
 
     device: cuda
-    mask_patterns: ["ID"]
+    mask_patterns: ["AUTO_MASK"]
     warmup_steps: 40000
     num_train_steps: 140010
     learning_rate: 0.0001

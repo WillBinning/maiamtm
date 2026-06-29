@@ -149,49 +149,60 @@ class ThreadDataset(Dataset):
             for path in threads:
 
                 self.paths.append(self.process_path(path,current_legal))
-    def padding_check(self, boards, moves):
+    def padding_check(self, boards, moves, strats):
         if len(boards) >= self.depth:
-            return boards, moves
+            return boards, moves, strats
 
         boards.append(torch.zeros(128))
         moves.append(torch.tensor(65))
+        strats.append(torch.zeros(5)) 
 
-        return self.padding_check(boards, moves)
-    def process_path(self, path,legal):
-            boards = []
-            moves = []
+        return self.padding_check(boards, moves, strats)
+    def process_path(self, path, legal):
+        boards = []
+        moves = []
+        strats = [] # 1. Initialize the list
 
-            # Slice the path to ensure it is exactly the length the model expects
-            for state in path[:self.depth]:
-                # --- board ---
+        # Slice the path to ensure it is exactly the length the model expects
+        for state in path[:self.depth]:
+            # --- board ---
+            white = state["white"]      # (8, 8)
+            black = state["black"]      # (8, 8)
+            
+            board = torch.stack([white, black]).flatten().float()  # (128,)
+            boards.append(board)
+            
+            # --- move ---
+            if state["move"] != 65:
+                moves.append(state["move"].long())
                 
-                white = state["white"]      # (8, 8)
-                black = state["black"]      # (8, 8)
-                
-                board = torch.stack([white, black]).flatten().float()  # (128,)
-                boards.append(board)
-                
+            # --- strat (NEW: Inside the loop) ---
+            # Extract features for THIS specific timestep
+            current_strat = torch.stack([
+                state["black_pieces"].float(),
+                state["white_pieces"].float(),
+                state["black_edge"].float(),
+                state["white_edge"].float(),
+                state["moves"].float()
+            ])
+            strats.append(current_strat)
 
-                # --- move ---
-                if state["move"] != 65:
-                    moves.append(state["move"].long())
-            # Check if padding is needed
-            # moves.append(torch.tensor(65))
-            boards, moves = self.padding_check(boards,moves)
-            # print("yippee")
+        # 2. Pass strats through the updated padding check
+        boards, moves, strats = self.padding_check(boards, moves, strats)
 
-            # print(self.type)
-            if self.type == "train":
-                return {
-                    "states": torch.stack(boards),     
-                    "actions": torch.stack(moves)
-                }
-            if self.type == 'eval':
-                return {
-                    "states": torch.stack(boards),     # Now strictly (4, 128)
-                    "actions": torch.stack(moves),     # Now strictly (4,)
-                    "legal": torch.tensor(legal)
-                }
+        if self.type == "train":
+            return {
+                "states": torch.stack(boards),     
+                "actions": torch.stack(moves),
+                "strats": torch.stack(strats) # 3. Stack into a [T, 5] tensor
+            }
+        if self.type == 'eval':
+            return {
+                "states": torch.stack(boards),     
+                "actions": torch.stack(moves),     
+                "legal": torch.tensor(legal),
+                "strats": torch.stack(strats) # 3. Stack into a [T, 5] tensor
+            }
 
     def __len__(self):
         return len(self.paths)

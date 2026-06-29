@@ -14,6 +14,52 @@ from omegaconf import OmegaConf
 
 from research.mtm.masks import MaskType
 
+import torch
+
+def create_strat_emb(traj, strats, emb_dim):
+    """
+    strats shape: [Batch, Time, 5]
+    Indices:
+      0: black_pieces
+      1: white_pieces
+      2: black_edge
+      3: white_edge
+      4: moves
+    """
+    # Extract features. Shape becomes [Batch, Time]
+    black_pieces = strats[:, :, 0]
+    white_pieces = strats[:, :, 1]
+    black_edge = strats[:, :, 2]
+    white_edge = strats[:, :, 3]
+    moves = strats[:, :, 4]
+
+    # Calculate strategies across the time dimension (dim=1)
+    flipped_amount = calculate_flip_strat(black_pieces)
+    edge_amount = calculate_edge_strat(black_edge)
+    opp_moves = calculate_move_strat(moves)
+    
+    # Stack them into a single tensor of shape [Batch, 3]
+    # You can now project this in your model using an nn.Linear layer
+    strat_features = torch.stack([flipped_amount, edge_amount, opp_moves], dim=-1)
+    
+    return strat_features
+
+def calculate_flip_strat(black_pieces):
+    # Subtract the first timestep from the last timestep for EACH batch item
+    flipped_amount = black_pieces[:, -1] - black_pieces[:, 0]
+    return flipped_amount
+
+def calculate_edge_strat(black_edge):
+    # Subtract the first timestep from the last timestep for EACH batch item
+    edge_amount = black_edge[:, -1] - black_edge[:, 0]
+    return edge_amount
+
+def calculate_move_strat(moves):
+    # Sum every alternating turn (1::2) along the Time dimension (dim=1)
+    opp_moves = moves[:, 1::2].sum(dim=1)
+    return opp_moves
+
+
 
 def load_hydra_path(path):
     hydra_cfg = OmegaConf.load(os.path.join(path, ".hydra/config.yaml"))

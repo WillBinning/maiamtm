@@ -13,7 +13,7 @@ import wandb
 from utils import create_strat_emb
 from research.mtm.tokenizers.base import TokenizerManager
 from research.utils.plot_utils import PlotHandler as ph
-
+import math
 
 def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
     """
@@ -231,37 +231,22 @@ class MTM(nn.Module):
                 torch.zeros(1, 1, shape[0], self.n_embd)
             )
 
-        self.encoder = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(
-                d_model=config.n_embd,
-                nhead=config.n_head,
-                dim_feedforward=config.n_embd * 4,
-                dropout=config.dropout,
-                activation="gelu",
-                batch_first=True,
-                norm_first=True,
-            ),
-            num_layers=config.n_enc_layer,
-            norm=nn.LayerNorm(self.n_embd),
-        )
-        if self.config.latent_dim is not None:
-            self.encoder_projection = nn.Sequential(
-                *[nn.GELU(), nn.Linear(self.n_embd, self.config.latent_dim)]
-            )
+        # Instead of nn.TransformerEncoder...
+        self.encoder_layers = nn.ModuleList([
+            StratAwareTransformerLayer(
+                dim=config.n_embd, 
+                heads=config.n_head, 
+                dropout=config.dropout
+            ) for _ in range(config.n_enc_layer)
+        ])
 
-        self.decoder = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(
-                d_model=self.n_embd,
-                nhead=config.n_head,
-                dim_feedforward=config.n_embd * 4,
-                dropout=config.dropout,
-                activation="gelu",
-                batch_first=True,
-                norm_first=True,
-            ),
-            num_layers=config.n_dec_layer,
-            norm=nn.LayerNorm(self.n_embd),
-        )
+        self.decoder_layers = nn.ModuleList([
+            StratAwareTransformerLayer(
+                dim=config.n_embd, 
+                heads=config.n_head, 
+                dropout=config.dropout
+            ) for _ in range(config.n_dec_layer)
+        ])
 
         self.output_head_dict = nn.ModuleDict()
         for key, shape in data_shapes.items():
@@ -357,31 +342,28 @@ class MTM(nn.Module):
         keep_len = len(ids)
         return x, ids_restore, keep_len
 
-    def trajectory_encoding(self, trajectories, move_indices, strats) -> Dict[str, torch.Tensor]:
+    def trajectory_encoding(self, trajectories, move_indices, strats) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
         encoded_trajectories = {}
-        # Fetch dynamic pos embeddings for this batch. Shape: (B, T, 1, n_embd)
         b_pos_embed = self.pos_embed[0, move_indices, :, :] 
+
+        # Calculate strat_emb once before the loop (it's the same for all keys)
+        strat_emb = create_strat_emb(trajectories, strats, self.config.n_embd)
+        strat_emb = self.strat_embedding(strat_emb.float())
+        strat_emb = strat_emb[:, None, None, :]
 
         for key, traj in trajectories.items():
             t = traj.shape[1]
-            key_pos_embed = b_pos_embed[:, :t, :, :] # Handles T-1 action lengths
-
-            strat_emb = create_strat_emb(trajectories, strats, self.config.n_embd)
-            strat_emb = self.strat_embedding(strat_emb.float())
-            strat_emb = strat_emb[:, None, None, :]
-
+            key_pos_embed = b_pos_embed[:, :t, :, :] 
             
             encoded_traj = (
                 self.encoder_embed_dict[key](traj.to(torch.float32))
                 + self.encoder_per_dim_encoding[key]
-                + strat_emb
-                # + self.pos_embed[:, : traj.shape[1], :, :]
-                # + key_pos_embed  # TODO 
             )
             b, t, p, c = encoded_traj.shape
             x = encoded_traj.reshape(b, t * p, c)
             encoded_trajectories[key] = x
-        return encoded_trajectories
+            
+        return encoded_trajectories, strat_emb # <--- Return it here
     
     # In mtm_model.py -> MTM class
 
@@ -433,31 +415,32 @@ class MTM(nn.Module):
 
     def forward(self, trajectories, masks, strats):
         batched_masks = self.process_masks(trajectories, masks)
-        
-        # Get move indices and pass to encoder
         move_indices = self.get_move_indices(trajectories)
-        embedded_trajectories = self.trajectory_encoding(trajectories, move_indices, strats)
         
+        # Catch the returned strat_emb
+        embedded_trajectories, strat_emb = self.trajectory_encoding(trajectories, move_indices, strats)
+        
+        # Pass it to the encoder
         encoded_trajectories, ids_restore, keep_length = self.forward_encoder(
-            embedded_trajectories, batched_masks
+            embedded_trajectories, batched_masks, strat_emb
         )
 
-        # Pass move_indices to decoder
-        return self.forward_decoder(encoded_trajectories, ids_restore, keep_length, move_indices,strats)
-
+        # Pass it to the decoder§
+        return self.forward_decoder(encoded_trajectories, ids_restore, keep_length, move_indices, strats, strat_emb)
+    
     def encode(self, trajectories, masks, strats) -> Dict[str, torch.Tensor]:
         batched_masks = self.process_masks(trajectories, masks)
         
         move_indices = self.get_move_indices(trajectories)
-        embedded_trajectories = self.trajectory_encoding(trajectories, move_indices, strats) # <-- PASS IT HERE
+        embedded_trajectories, strat_emb = self.trajectory_encoding(trajectories, move_indices, strats) # <-- PASS IT HERE
 
         encoded_trajectories, ids_restore, keep_length = self.forward_encoder(
-            embedded_trajectories, batched_masks
+            embedded_trajectories, batched_masks, strat_emb
         )
 
         return encoded_trajectories
 
-    def forward_encoder(self, trajectories, masks):
+    def forward_encoder(self, trajectories, masks, strat_emb):
         features = []
         ids_restore = {}
         keep_len = {}
@@ -471,7 +454,9 @@ class MTM(nn.Module):
             features.append(x)
 
         x = torch.cat(features, dim=1)
-        x = self.encoder(x)
+        for layer in self.encoder_layers:
+            x = layer(x, strat_emb)
+        # x = self.encoder(x)
         if self.config.latent_dim is not None:
             x = self.encoder_projection(x)  # project down
 
@@ -502,9 +487,9 @@ class MTM(nn.Module):
             encoded_traj = (
                 self.decoder_embed_dict[key](re_traj)
                 + self.decoder_per_dim_encoding[key]
-                + strat_emb
+                # + strat_emb
                 # + self.pos_embed[:, : traj.shape[1], :, :]
-                # + key_pos_embed  # TODO 
+                # + key_pos_embed  #  
             )
             b, t, p, c = encoded_traj.shape
             x = encoded_traj.reshape(b, t * p, c)
@@ -517,7 +502,8 @@ class MTM(nn.Module):
         ids_restore: Dict[str, torch.Tensor],
         keep_lengths: Dict[str, torch.Tensor],
         move_indices: torch.Tensor, 
-        strats
+        strats,
+        strat_emb 
     ):
         """
         Args:
@@ -550,13 +536,18 @@ class MTM(nn.Module):
             encoded_trajectories_with_mask,
             move_indices,
             strats
-            #TODO   
+            #   
         )
         concat_trajectories = torch.cat(
             [decoder_embedded_trajectories[k] for k in keys], dim=1
         )
 
-        x = self.decoder(concat_trajectories)
+
+        # Replace self.decoder with your custom layer loop
+        x = concat_trajectories
+        for layer in self.decoder_layers:
+            x = layer(x, strat_emb)
+
         extracted_trajectories = {}
         pos = 0
         for k in keys:
@@ -596,7 +587,7 @@ class MTM(nn.Module):
         assert trajectories_copy["states"].shape[0] == 1
 
         while not masks_filled(masks_copy):
-            traj_predictions = self(trajectories_copy, masks_copy)
+            traj_predictions = self(trajectories_copy, masks_copy, strats)
             # sample from the logits
             for k, traj_logits in traj_predictions.items():
                 B, L, I, _ = traj_logits.shape
@@ -688,3 +679,55 @@ class MTM(nn.Module):
         ]
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas)
         return optimizer
+
+
+class StratAwareAttention(nn.Module):
+    def __init__(self, dim, heads=2, dropout=0.0):
+        super().__init__()
+        self.heads = heads
+        self.dim_head = dim // heads
+        
+        self.to_qkv = nn.Linear(dim, dim * 3, bias=False)
+        self.strat_to_q = nn.Linear(dim, dim, bias=False) 
+        self.to_out = nn.Linear(dim, dim)
+        self.dropout_p = dropout
+
+    def forward(self, x, strat_emb):
+        B, T, C = x.shape
+        
+        qkv = self.to_qkv(x).chunk(3, dim=-1)
+        q, k, v = map(lambda t: t.view(B, T, self.heads, self.dim_head).transpose(1, 2), qkv)
+        
+
+        strat_flat = strat_emb.view(B, -1) 
+        strat_effect = self.strat_to_q(strat_flat)
+        
+        strat_effect = strat_effect.view(B, self.heads, 1, self.dim_head)
+        q = q + strat_effect #TODO this is the strategy
+        
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.dim_head)
+        attn = F.softmax(scores, dim=-1)
+        if self.training and self.dropout_p > 0.0:
+            attn = F.dropout(attn, p=self.dropout_p)
+        out = torch.matmul(attn, v)  
+        out = out.transpose(1, 2).contiguous().view(B, T, C)
+        return self.to_out(out)
+
+class StratAwareTransformerLayer(nn.Module):
+    def __init__(self, dim, heads, dropout):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = StratAwareAttention(dim, heads, dropout)
+        self.norm2 = nn.LayerNorm(dim) 
+        self.ff = nn.Sequential(
+            nn.Linear(dim, dim * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim * 4, dim),
+            nn.Dropout(dropout)
+        )
+
+    def forward(self, x, strat_emb):
+        x = x + self.attn(self.norm1(x), strat_emb)
+        x = x + self.ff(self.norm2(x))
+        return x

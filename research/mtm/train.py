@@ -57,7 +57,7 @@ from research.mtm.utils import (
 )
 
 dir_path = os.path.dirname(os.path.realpath(__file__))
-suffix = "_AR_NoSTRAT_Big"
+suffix = "_AB_MAIA_SINGLE"
 
 def eval_fd(
     model: MTM,
@@ -773,7 +773,7 @@ def _main(hydra_cfg):
     train_dataset, val_dataset = hydra.utils.call(
         hydra_cfg.train_dataset, seq_steps=cfg.traj_length
     )
-    # print(train_dataset[0])
+    
 
 
     logger.info(f"Train set size = {len(train_dataset)}")

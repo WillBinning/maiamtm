@@ -6,7 +6,7 @@ defaults:
 # 1. Define your custom dataset target
 train_dataset:
     _target_: research.mtm.datasets.rustothello.ThreadDataset.create_splits
-    data_path:  "/home/will/projects/files/big_training_boards.txt"
+    data_path:  "/home/will/projects/files/testing_boards_single.txt"
     # "/home/will/projects/files/training_boards.txt"
 
 eval_dataset: 
